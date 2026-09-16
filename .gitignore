@@ -1,0 +1,18 @@
+# macOS and IDE settings
+.DS_Store
+.idea/
+.vscode/
+
+# CMake build products
+cmake-build-*/
+build/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Compiled binaries and object files
+*.o
+*.a
+*.dylib
+*.app
+tp
