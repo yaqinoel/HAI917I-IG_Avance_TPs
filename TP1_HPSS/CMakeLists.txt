@@ -24,21 +24,21 @@ if(NOT TARGET polyscope)
 endif()
 
 # Application
-add_executable(tp1_hpss
+add_executable(TP1_HPSS
         src/main.cpp
 )
 
-target_include_directories(tp1_hpss PRIVATE
+target_include_directories(TP1_HPSS PRIVATE
         ${DEPS_DIR}/libigl/include
         ${DEPS_DIR}/deps/
         ${DEPS_DIR}
 )
 
-target_compile_definitions(tp1_hpss PRIVATE
+target_compile_definitions(TP1_HPSS PRIVATE
         TP1_HPSS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
-target_link_libraries(tp1_hpss PRIVATE
+target_link_libraries(TP1_HPSS PRIVATE
         polyscope
         Eigen3::Eigen
 )
