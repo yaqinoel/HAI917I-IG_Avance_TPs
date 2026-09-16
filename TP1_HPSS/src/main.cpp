@@ -212,7 +212,11 @@ int main(int argc, char **argv) {
     std::vector<glm::vec3> points;
     std::vector<glm::vec3> normals;
 
-    readPointCloud("../data/points/points_normals/bunny.xyz", points, normals);
+    readPointCloud(
+        std::string(TP1_HPSS_SOURCE_DIR) + "/data/points/points_normals/bunny.xyz",
+        points,
+        normals
+    );
     auto ps = polyscope::registerPointCloud("points set",points);
     ps->addVectorQuantity("normals", normals);
     ps->resetTransform();

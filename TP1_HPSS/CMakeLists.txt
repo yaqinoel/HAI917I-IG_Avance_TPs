@@ -1,7 +1,3 @@
-cmake_minimum_required(VERSION 3.20)
-
-project(asap_hlod LANGUAGES CXX)
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -23,20 +19,26 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Eigen)
 
 # Dependencies
-add_subdirectory(${DEPS_DIR}/polyscope)
+if(NOT TARGET polyscope)
+    add_subdirectory(${DEPS_DIR}/polyscope)
+endif()
 
 # Application
-add_executable(tp
+add_executable(tp1_hpss
         src/main.cpp
 )
 
-target_include_directories(tp PRIVATE
+target_include_directories(tp1_hpss PRIVATE
         ${DEPS_DIR}/libigl/include
         ${DEPS_DIR}/deps/
         ${DEPS_DIR}
 )
 
-target_link_libraries(tp PRIVATE
+target_compile_definitions(tp1_hpss PRIVATE
+        TP1_HPSS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+target_link_libraries(tp1_hpss PRIVATE
         polyscope
         Eigen3::Eigen
 )
