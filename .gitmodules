@@ -1,6 +1,6 @@
-[submodule "TP1_HPSS/deps/polyscope"]
-	path = TP1_HPSS/deps/polyscope
+[submodule "deps/polyscope"]
+	path = deps/polyscope
 	url = https://github.com/nmwsharp/polyscope.git
-[submodule "TP1_HPSS/deps/libigl"]
-	path = TP1_HPSS/deps/libigl
+[submodule "deps/libigl"]
+	path = deps/libigl
 	url = https://github.com/libigl/libigl.git
