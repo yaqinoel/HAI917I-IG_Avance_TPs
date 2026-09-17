@@ -391,10 +391,6 @@ TriangleMesh DualContouring(Grid& grid,
         }
     }
 
-    auto* psMesh = polyscope::registerSurfaceMesh( "dual contouring mesh", mesh.vertices, mesh.triangles );
-
-    psMesh->setSmoothShade(true);
-
     return mesh;
 }
 
@@ -429,7 +425,9 @@ void callback(const std::vector<glm::vec3>& points,
 
     if (ImGui::Button("Dual Contouring")) {
         // create regular grid
-        glm::ivec3 resolution(32,32,32);
+        // glm::ivec3 resolution(64,64,64);
+        // glm::ivec3 resolution(64,64,64);
+        glm::ivec3 resolution(128,128,128);
         glm::vec3 gridSize(10.0, 10.0, 10.0);
         glm::vec3 cellSize(gridSize.x / resolution.x, gridSize.y / resolution.y, gridSize.z / resolution.z );
 
@@ -438,6 +436,11 @@ void callback(const std::vector<glm::vec3>& points,
         Grid grid(resolution, origin, cellSize);
 
         TriangleMesh mesh = DualContouring(grid, points, normals, tree);
+
+        auto* psMesh = polyscope::registerSurfaceMesh( "dual contouring mesh", mesh.vertices, mesh.triangles );
+
+        psMesh->setSmoothShade(true);
+        psMesh->resetTransform();
 
     }
 
