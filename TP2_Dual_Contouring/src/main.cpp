@@ -237,6 +237,14 @@ TriangleMesh DualContouring(Grid& grid,
     ) {
 
     TriangleMesh mesh;
+    // Use a smaller local MLS neighbourhood for thin features such as the
+    // ears and feet. These values must be shared by SDF evaluation and by
+    // the projection used to position a cell vertex.
+    constexpr int kernelType = 1; // Wendland
+    constexpr float radius = 0.3f;
+    constexpr unsigned int iterations = 5;
+    constexpr unsigned int knn = 16;
+
     grid.cellVertexIds.assign(grid.cellResolution.x * grid.cellResolution.y * grid.cellResolution.z, -1);
     grid.sdfValues.assign((grid.cellResolution.x + 1) * (grid.cellResolution.y + 1) * (grid.cellResolution.z + 1), 0.0);
 
@@ -245,7 +253,8 @@ TriangleMesh DualContouring(Grid& grid,
         for (int j = 0; j <= grid.cellResolution.y; ++j) {
             for (int k = 0; k <= grid.cellResolution.z; ++k) {
                 glm::vec3 point = grid.gridVertexPosition(i,j,k);
-                float value = implicitSDF(point, pointSet, normalsSet, tree, 1, 0.5f, 10, 20 );
+                float value = implicitSDF(point, pointSet, normalsSet, tree,
+                                          kernelType, radius, iterations, knn);
                 std::size_t index = grid.gridVertexIndex(i,j,k);
                 grid.sdfValues[index] = value;
             }
@@ -288,7 +297,15 @@ TriangleMesh DualContouring(Grid& grid,
 
                 // TODO
                 // projet cell center on MLS as vertex
-                HPSS(cellCenter, cellVertex, cellNormal, pointSet, normalsSet, tree, 1, 0.5f, 10, 20 );
+                HPSS(cellCenter, cellVertex, cellNormal, pointSet, normalsSet, tree,
+                     kernelType, radius, iterations, knn);
+
+                // A dual-contouring vertex belongs to this cell. HPSS can
+                // otherwise project it across a thin feature and create long,
+                // spiky triangles when adjacent cells are connected.
+                const glm::vec3 cellMin = grid.gridVertexPosition(i,     j,     k);
+                const glm::vec3 cellMax = grid.gridVertexPosition(i + 1, j + 1, k + 1);
+                cellVertex = glm::clamp(cellVertex, cellMin, cellMax);
 
                 const int vertexId = static_cast<int>(mesh.vertices.size());
                 mesh.vertices.push_back(cellVertex);
@@ -425,9 +442,9 @@ void callback(const std::vector<glm::vec3>& points,
 
     if (ImGui::Button("Dual Contouring")) {
         // create regular grid
+        glm::ivec3 resolution(32,32,32);
         // glm::ivec3 resolution(64,64,64);
-        // glm::ivec3 resolution(64,64,64);
-        glm::ivec3 resolution(128,128,128);
+        // glm::ivec3 resolution(128,128,128);
         glm::vec3 gridSize(10.0, 10.0, 10.0);
         glm::vec3 cellSize(gridSize.x / resolution.x, gridSize.y / resolution.y, gridSize.z / resolution.z );
 
