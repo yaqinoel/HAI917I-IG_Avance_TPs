@@ -23,3 +23,5 @@ add_subdirectory(deps/polyscope)
 add_subdirectory(TP1_HPSS)
 
 add_subdirectory(TP2_Dual_Contouring)
+
+add_subdirectory(TP3_Recalage)
