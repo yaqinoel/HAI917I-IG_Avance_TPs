@@ -130,11 +130,15 @@ void HPSS(glm::vec3 inputPoint,
     const int kernerl_type,
     const float radius,
     const unsigned int nbIterations = 10,
-    const unsigned int knn = 20
+    const unsigned int knn = 20,
+    glm::vec3* initialNormal = nullptr
     ) {
 
     glm::vec3 currentPoint = inputPoint;
     glm::vec3 currentNormal(0.0f);
+    if (initialNormal != nullptr) {
+        *initialNormal = glm::vec3(0.0f);
+    }
 
     // iteration
     for (int i = 0; i < nbIterations; ++i) {
@@ -176,6 +180,9 @@ void HPSS(glm::vec3 inputPoint,
 
         avgNormal = glm::normalize(avgNormal);
 
+        if (i == 0 && initialNormal != nullptr) {
+            *initialNormal = avgNormal;
+        }
         currentNormal = avgNormal;
         currentPoint = avgPoint;
     }
@@ -195,9 +202,13 @@ float implicitSDF(glm::vec3 x,
 ) {
     glm::vec3 projetedPoint;
     glm::vec3 projectedNormal;
-    HPSS(x, projetedPoint, projectedNormal, pointsSet, normalsSet, tree, kernerl_type, radius, nbIterations, knn);
+    glm::vec3 initialNormal;
+    HPSS(x, projetedPoint, projectedNormal, pointsSet, normalsSet, tree,
+         kernerl_type, radius, nbIterations, knn, &initialNormal);
 
-    return glm::dot(x - projetedPoint, projectedNormal);
+    // Keep the normal estimated at x: the final normal may belong to a
+    // different surface patch when a distant query moves during projection.
+    return glm::dot(x - projetedPoint, initialNormal);
 }
 
 void addQuad(TriangleMesh& mesh, int a, int b, int c, int d, bool flip ) {
@@ -237,13 +248,11 @@ TriangleMesh DualContouring(Grid& grid,
     ) {
 
     TriangleMesh mesh;
-    // Use a smaller local MLS neighbourhood for thin features such as the
-    // ears and feet. These values must be shared by SDF evaluation and by
-    // the projection used to position a cell vertex.
-    constexpr int kernelType = 1; // Wendland
-    constexpr float radius = 0.3f;
-    constexpr unsigned int iterations = 5;
-    constexpr unsigned int knn = 16;
+    // Keep iterative HPSS projection while evaluating the sign at each grid corner.
+    constexpr int kernelType = 0; // Gaussian
+    constexpr float radius = 0.5f;
+    constexpr unsigned int sdfIterations = 10;
+    constexpr unsigned int knn = 20;
 
     grid.cellVertexIds.assign(grid.cellResolution.x * grid.cellResolution.y * grid.cellResolution.z, -1);
     grid.sdfValues.assign((grid.cellResolution.x + 1) * (grid.cellResolution.y + 1) * (grid.cellResolution.z + 1), 0.0);
@@ -254,7 +263,7 @@ TriangleMesh DualContouring(Grid& grid,
             for (int k = 0; k <= grid.cellResolution.z; ++k) {
                 glm::vec3 point = grid.gridVertexPosition(i,j,k);
                 float value = implicitSDF(point, pointSet, normalsSet, tree,
-                                          kernelType, radius, iterations, knn);
+                                          kernelType, radius, sdfIterations, knn);
                 std::size_t index = grid.gridVertexIndex(i,j,k);
                 grid.sdfValues[index] = value;
             }
@@ -297,12 +306,8 @@ TriangleMesh DualContouring(Grid& grid,
 
                 // TODO
                 // projet cell center on MLS as vertex
-                HPSS(cellCenter, cellVertex, cellNormal, pointSet, normalsSet, tree,
-                     kernelType, radius, iterations, knn);
+                HPSS(cellCenter, cellVertex, cellNormal, pointSet, normalsSet, tree, kernelType, radius, 10, knn);
 
-                // A dual-contouring vertex belongs to this cell. HPSS can
-                // otherwise project it across a thin feature and create long,
-                // spiky triangles when adjacent cells are connected.
                 const glm::vec3 cellMin = grid.gridVertexPosition(i,     j,     k);
                 const glm::vec3 cellMax = grid.gridVertexPosition(i + 1, j + 1, k + 1);
                 cellVertex = glm::clamp(cellVertex, cellMin, cellMax);
@@ -347,7 +352,7 @@ TriangleMesh DualContouring(Grid& grid,
                 int vertexCId = grid.cellVertexIds[cellVertexCIndex];
                 int vertexDId = grid.cellVertexIds[cellVertexDIndex];
 
-                addQuad(mesh, vertexAId, vertexBId, vertexCId, vertexDId, value0 <= 0.0f);
+                addQuad(mesh, vertexAId, vertexBId, vertexCId, vertexDId, value0 < 0.0f);
             }
         }
     }
@@ -375,7 +380,7 @@ TriangleMesh DualContouring(Grid& grid,
                 int vertexCId = grid.cellVertexIds[cellVertexCIndex];
                 int vertexDId = grid.cellVertexIds[cellVertexDIndex];
 
-                addQuad(mesh, vertexAId, vertexBId, vertexCId, vertexDId, value0 <= 0.0f);
+                addQuad(mesh, vertexAId, vertexBId, vertexCId, vertexDId, value0 >= 0.0f);
             }
         }
     }
@@ -403,7 +408,7 @@ TriangleMesh DualContouring(Grid& grid,
                 int vertexCId = grid.cellVertexIds[cellVertexCIndex];
                 int vertexDId = grid.cellVertexIds[cellVertexDIndex];
 
-                addQuad(mesh, vertexAId, vertexBId, vertexCId, vertexDId, value0 <= 0.0f);
+                addQuad(mesh, vertexAId, vertexBId, vertexCId, vertexDId, value0 >= 0.0f);
             }
         }
     }
