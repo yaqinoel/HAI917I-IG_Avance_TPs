@@ -173,7 +173,7 @@ void callback(const std::vector<glm::vec3>& points,
     ImGui::PushItemWidth(100);
     ImGuiIO &io = ImGui::GetIO();
     if (ImGui::Button("cool geometry process")) {
-        constexpr unsigned int numPoints = 100;
+        constexpr unsigned int numPoints = 1000;
 
         // 1) generate 100 random input points
         std::vector<glm::vec3> inputPoints = generateRandomPointCloud(numPoints, 4.0f);
@@ -185,7 +185,7 @@ void callback(const std::vector<glm::vec3>& points,
         std::vector<glm::vec3> outputNormals(numPoints);
 
         for (unsigned int i = 0; i < numPoints; i++) {
-            HPSS(inputPoints[i], outputPoints[i], outputNormals[i], points, normals, tree, 0, 0.5f, 10, 20 );
+            HPSS(inputPoints[i], outputPoints[i], outputNormals[i], points, normals, tree, 0, 1.0f, 10, 20 );
         }
 
         // 3) draw projected points
