@@ -6,6 +6,8 @@
 #include <Eigen/Dense>
 #include <Eigen/Core>
 #include <array>
+#include <limits>
+#include <stdexcept>
 
 
 using namespace nanoflann;
@@ -28,6 +30,12 @@ struct GLMVectorAdaptor {
     bool kdtree_get_bbox(BBOX&) const {
         return false;
     }
+};
+
+struct Correspondence {
+    size_t sourceIndex;
+    size_t targetIndex;
+    float squaredDistance;
 };
 
 using KDTree = nanoflann::KDTreeSingleIndexAdaptor<
@@ -113,7 +121,11 @@ void acp(const std::vector<glm::vec3> &points, Eigen::Vector3d& centroid, Eigen:
     eigenVectors = solver.eigenvectors();
 }
 
-void acpRecalage(std::vector<glm::vec3> &pointsCanditate, std::vector<glm::vec3> &pointsTarget, glm::mat3 &rotation, glm::vec3 &translation) {
+void acpRecalage(const std::vector<glm::vec3> &pointsCanditate, const std::vector<glm::vec3> &pointsTarget, glm::mat3 &rotation, glm::vec3 &translation) {
+    if (pointsCanditate.empty() || pointsTarget.empty()) {
+        throw std::invalid_argument("Point sets can not be empty");
+    }
+
     Eigen::Vector3d centroid1, centroid2;
     Eigen::Vector3d eigenValues1, eigenValues2;
     Eigen::Matrix3d eigenVectors1, eigenVectors2;
@@ -121,11 +133,49 @@ void acpRecalage(std::vector<glm::vec3> &pointsCanditate, std::vector<glm::vec3>
     acp(pointsCanditate, centroid1, eigenValues1, eigenVectors1);
     acp(pointsTarget, centroid2, eigenValues2, eigenVectors2);
 
-    Eigen::Matrix3d R = eigenVectors2 * eigenVectors1.transpose();
+    auto adaptor = GLMVectorAdaptor(pointsTarget);
+    KDTree tree(3, adaptor, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+    tree.buildIndex();
 
-    if (R.determinant() < 0.0) {
-        eigenVectors2.col(2) *= -1.0;
-        R = eigenVectors2 * eigenVectors1.transpose();
+    // Each principal axis can point in either direction. Keep only proper rotations.
+    const double baseDeterminant = (eigenVectors2 * eigenVectors1.transpose()).determinant();
+    double bestSquaredError = std::numeric_limits<double>::infinity();
+    Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d T = Eigen::Vector3d::Zero();
+
+    for (int signX : {-1, 1}) {
+        for (int signY : {-1, 1}) {
+            Eigen::Matrix3d signs = Eigen::Matrix3d::Identity();
+            signs(0, 0) = signX;
+            signs(1, 1) = signY;
+            signs(2, 2) = (baseDeterminant < 0.0 ? -1 : 1) * signX * signY;
+
+            const Eigen::Matrix3d candidateR = eigenVectors2 * signs * eigenVectors1.transpose();
+            const Eigen::Vector3d candidateT = centroid2 - candidateR * centroid1;
+
+            double squaredError = 0.0;
+            for (const auto& point : pointsCanditate) {
+                const Eigen::Vector3d p(point.x, point.y, point.z);
+                const Eigen::Vector3d transformed = candidateR * p + candidateT;
+                const glm::vec3 query = glm::vec3(transformed.x(), transformed.y(), transformed.z());
+
+                size_t nearestIndex{};
+                float squaredDistance{};
+                nanoflann::KNNResultSet<float> resultSet(1);
+                resultSet.init(&nearestIndex, &squaredDistance);
+                tree.findNeighbors(resultSet, &query[0], nanoflann::SearchParameters());
+                if (resultSet.size() != 1) {
+                    throw std::runtime_error("Nearest-neighbor search returned no point");
+                }
+                squaredError += squaredDistance;
+            }
+
+            if (squaredError < bestSquaredError) {
+                bestSquaredError = squaredError;
+                R = candidateR;
+                T = candidateT;
+            }
+        }
     }
 
     for (int row = 0; row < 3; ++row) {
@@ -134,14 +184,21 @@ void acpRecalage(std::vector<glm::vec3> &pointsCanditate, std::vector<glm::vec3>
         }
     }
 
-    Eigen::Vector3d T = centroid2 - R * centroid1;
-
     translation.x = T.x();
     translation.y = T.y();
     translation.z = T.z();
 }
 
 void svdRecalage(std::vector<glm::vec3> &pointsCanditate, std::vector<glm::vec3> &pointsTarget, glm::mat3 &rotation, glm::vec3 &translation) {
+
+    if (pointsCanditate.empty() || pointsTarget.empty()) {
+        throw std::invalid_argument("Point sets cant not be empty");
+    }
+
+    if (pointsCanditate.size() !=  pointsTarget.size()) {
+        throw std::invalid_argument("Point sets must be the same size");
+    }
+
     // compute center
     Eigen::Vector3d centroidCanditate = Eigen::Vector3d::Zero();
     Eigen::Vector3d centroidTarget = Eigen::Vector3d::Zero();
@@ -174,9 +231,12 @@ void svdRecalage(std::vector<glm::vec3> &pointsCanditate, std::vector<glm::vec3>
     Eigen::JacobiSVD<Eigen::Matrix3d> svd( crossCovariance, Eigen::ComputeFullU | Eigen::ComputeFullV );
     Eigen::Matrix3d U = svd.matrixU();
     Eigen::Matrix3d V = svd.matrixV();
-    Eigen::Vector3d S = svd.singularValues();
 
-    Eigen::Matrix3d R = V * U.transpose();
+    Eigen::Matrix3d correction = Eigen::Matrix3d::Identity();
+    if ((V * U.transpose()).determinant() < 0.0) {
+        correction(2, 2) = -1.0;
+    }
+    Eigen::Matrix3d R = V * correction * U.transpose();
 
     Eigen::Vector3d T = centroidTarget - R * centroidCanditate;
 
@@ -189,6 +249,98 @@ void svdRecalage(std::vector<glm::vec3> &pointsCanditate, std::vector<glm::vec3>
     translation.x = T.x();
     translation.y = T.y();
     translation.z = T.z();
+}
+
+void icpRecalage(const std::vector<glm::vec3> &pointsCandidate, const std::vector<glm::vec3> &pointsTarget, glm::mat3 &rotation, glm::vec3 &translation) {
+    if (pointsCandidate.empty() || pointsTarget.empty()) {
+        throw std::invalid_argument("Point sets cant not be empty");
+    }
+
+
+    glm::mat3 totalR(1.0f);
+    glm::vec3 totalT = glm::vec3(0.0f);
+
+    acpRecalage(pointsCandidate, pointsTarget,totalR, totalT);
+
+    // apply ACP recalage to the working copy.
+    std::vector<glm::vec3> pointsSource = pointsCandidate;
+    for (auto& point : pointsSource) {
+        point = totalR * point + totalT;
+    }
+
+    // build KD-Tree for pointsTarget
+    auto adaptor = GLMVectorAdaptor(pointsTarget);
+    KDTree tree(3,adaptor, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+    tree.buildIndex();
+
+    double lastRSMD = 0.0;
+
+    // ierations
+    for (std::size_t round = 0; round < 100; ++round) {
+
+        // build correspondence relation
+        std::vector<Correspondence> correspondences;
+        correspondences.reserve(pointsSource.size());
+
+        for (std::size_t i = 0; i < pointsSource.size(); ++i) {
+            glm::vec3 &queryPoint = pointsSource[i];
+            size_t nearestIndex{};
+            float squaredDistance{};
+            nanoflann::KNNResultSet<float> resultSet(1);
+            resultSet.init(&nearestIndex, &squaredDistance);
+            tree.findNeighbors(resultSet, &queryPoint[0], nanoflann::SearchParameters());
+            if (resultSet.size() != 1) {
+                throw std::runtime_error("Nearest-neighbor search returned no point");
+            }
+            correspondences.push_back({i, nearestIndex, squaredDistance});
+        }
+
+        // compute RSMD for this iteration
+        double RSMD = 0.0;
+        for (auto& c : correspondences) {
+            RSMD += c.squaredDistance;
+        }
+        RSMD = std::sqrt(RSMD / correspondences.size());
+        std::cout << "Round: " << round << ", RSMD: " << RSMD << std::endl;
+
+        if (std::abs(RSMD - lastRSMD) < 1e-5) {
+            std::cout << "Early stop..." << std::endl;
+            break;
+        }
+
+        // create point set for svd recalage
+        std::vector<glm::vec3> pSource;
+        std::vector<glm::vec3> pTarget;
+        pSource.reserve(correspondences.size());
+        pTarget.reserve(correspondences.size());
+        for (std::size_t i = 0; i < correspondences.size(); ++i) {
+            size_t indexSource = correspondences[i].sourceIndex;
+            size_t indexTarget = correspondences[i].targetIndex;
+            pSource.push_back(pointsSource[indexSource]);
+            pTarget.push_back(pointsTarget[indexTarget]);
+        }
+
+        glm::mat3 deltaR(1.0f);
+        glm::vec3 deltaT(0.0f);
+
+        // svd recalage
+        svdRecalage(pSource, pTarget, deltaR, deltaT);
+
+        totalT = deltaR * totalT + deltaT;
+        totalR = deltaR * totalR;
+
+        // apply rotation and translation
+        for (auto& point : pointsSource) {
+            point = deltaR * point + deltaT;
+        }
+
+        lastRSMD = RSMD;
+
+    }
+
+    // update (return) result
+    rotation = totalR;
+    translation = totalT;
 }
 
 void callback(std::vector<glm::vec3> & points1, std::vector<glm::vec3> points2, polyscope::PointCloud* ps1, polyscope::PointCloud* ps2) {
@@ -267,6 +419,20 @@ void callback(std::vector<glm::vec3> & points1, std::vector<glm::vec3> points2, 
         ps2->updatePointPositions(points2);
     }
 
+    if (ImGui::Button("ICP Recalage")) {
+        glm::mat3 rotation(1.0f);
+        glm::vec3 translation(0.0f);
+
+        icpRecalage(points1, points2, rotation, translation);
+
+        for (auto &p : points1) {
+            p = rotation * p + translation;
+        }
+
+        ps1->updatePointPositions(points1);
+        ps2->updatePointPositions(points2);
+    }
+
 }
 
 int main(int argc, char **argv) {
@@ -279,37 +445,6 @@ int main(int argc, char **argv) {
     // Initialize polyscope
     polyscope::init();
 
-
-    /*
-
-    // Build KD tree
-    auto adaptor = GLMVectorAdaptor(points);
-    KDTree tree(3,adaptor, nanoflann::KDTreeSingleIndexAdaptorParams(10));
-    tree.buildIndex();
-
-    glm::vec3 query = points[0];
-
-    const size_t k = 10;
-    std::vector<size_t> indices(k);
-    std::vector<float> distances(k);
-    nanoflann::KNNResultSet<float> resultSet(k);
-    resultSet.init(indices.data(), distances.data());
-
-    tree.findNeighbors(
-            resultSet,
-            &query[0],
-            nanoflann::SearchParameters()
-    );
-    // KD tree Query
-    for (size_t j = 0; j < resultSet.size(); ++j)
-    {
-        size_t neighbor = indices[j];
-        float dist2 = distances[j];
-
-        std::cout << neighbor << "  " << dist2 << '\n';
-    }
-    */
-
     // Eigen
     Eigen::VectorXd vector;
 
@@ -319,8 +454,8 @@ int main(int argc, char **argv) {
     std::vector<glm::vec3> points;
     std::vector<glm::vec3> normals;
 
-    readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino.pn", points, normals);
-    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino_subsampled_extreme.pn", points, normals);
+    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino.pn", points, normals);
+    readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino_subsampled_extreme.pn", points, normals);
 
     auto ps = polyscope::registerPointCloud("input ps",points);
     ps->addVectorQuantity("normals", normals);
@@ -330,8 +465,8 @@ int main(int argc, char **argv) {
     std::vector<glm::vec3> points2;
     std::vector<glm::vec3> normals2;
 
-    readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino2.pn", points2, normals2);
-    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino2_subsampled_extreme.pn", points2, normals2);
+    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino2.pn", points2, normals2);
+    readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino2_subsampled_extreme.pn", points2, normals2);
 
     auto ps2 = polyscope::registerPointCloud("input ps2",points2);
     ps2->addVectorQuantity("normals2", normals2);
