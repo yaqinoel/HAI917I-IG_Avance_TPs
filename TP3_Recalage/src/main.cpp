@@ -5,8 +5,10 @@
 #include "nanoflann.hpp"
 #include <Eigen/Dense>
 #include <Eigen/Core>
+#include <algorithm>
 #include <array>
 #include <limits>
+#include <random>
 #include <stdexcept>
 
 
@@ -30,12 +32,6 @@ struct GLMVectorAdaptor {
     bool kdtree_get_bbox(BBOX&) const {
         return false;
     }
-};
-
-struct Correspondence {
-    size_t sourceIndex;
-    size_t targetIndex;
-    float squaredDistance;
 };
 
 using KDTree = nanoflann::KDTreeSingleIndexAdaptor<
@@ -95,6 +91,58 @@ void readPNFile(
         positions.emplace_back(data[0], data[1], data[2]);
         normals.emplace_back(data[3], data[4], data[5]);
     }
+}
+
+struct RigidTransform {
+    glm::mat3 rotation{1.0f};
+    glm::vec3 translation{0.0f};
+};
+
+RigidTransform applyRandomRigidTransform(std::vector<glm::vec3>& points,
+                                         std::vector<glm::vec3>* normals = nullptr) {
+    if (points.empty()) {
+        throw std::invalid_argument("Point cloud can not be empty");
+    }
+    if (normals != nullptr && !normals->empty() && normals->size() != points.size()) {
+        throw std::invalid_argument("Points and normals must have the same size");
+    }
+
+    static std::mt19937 generator(std::random_device{}());
+    std::normal_distribution<double> gaussian(0.0, 1.0);
+    Eigen::Quaterniond quaternion;
+    do {
+        quaternion = Eigen::Quaterniond(gaussian(generator), gaussian(generator),
+                                        gaussian(generator), gaussian(generator));
+    } while (quaternion.norm() < 1e-12);
+    quaternion.normalize();
+
+    const Eigen::Matrix3d eigenRotation = quaternion.toRotationMatrix();
+    RigidTransform transform;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            transform.rotation[col][row] = static_cast<float>(eigenRotation(row, col));
+        }
+    }
+
+    glm::vec3 minPoint = points.front();
+    glm::vec3 maxPoint = points.front();
+    for (const auto& point : points) {
+        minPoint = glm::min(minPoint, point);
+        maxPoint = glm::max(maxPoint, point);
+    }
+    const float translationScale = 0.5f * glm::length(maxPoint - minPoint);
+    std::uniform_real_distribution<float> uniform(-translationScale, translationScale);
+    transform.translation = glm::vec3(uniform(generator), uniform(generator), uniform(generator));
+
+    for (auto& point : points) {
+        point = transform.rotation * point + transform.translation;
+    }
+    if (normals != nullptr) {
+        for (auto& normal : *normals) {
+            normal = transform.rotation * normal;
+        }
+    }
+    return transform;
 }
 
 void acp(const std::vector<glm::vec3> &points, Eigen::Vector3d& centroid, Eigen::Vector3d& eigenValues, Eigen::Matrix3d& eigenVectors) {
@@ -165,7 +213,7 @@ void acpRecalage(const std::vector<glm::vec3> &pointsCanditate, const std::vecto
                 resultSet.init(&nearestIndex, &squaredDistance);
                 tree.findNeighbors(resultSet, &query[0], nanoflann::SearchParameters());
                 if (resultSet.size() != 1) {
-                    throw std::runtime_error("Nearest-neighbor search returned no point");
+                    throw std::runtime_error("Nearest neighbor search returned no point");
                 }
                 squaredError += squaredDistance;
             }
@@ -251,18 +299,65 @@ void svdRecalage(std::vector<glm::vec3> &pointsCanditate, std::vector<glm::vec3>
     translation.z = T.z();
 }
 
-void icpRecalage(const std::vector<glm::vec3> &pointsCandidate, const std::vector<glm::vec3> &pointsTarget, glm::mat3 &rotation, glm::vec3 &translation) {
+glm::vec3 projectHPSS(const glm::vec3& inputPoint,
+                      const std::vector<glm::vec3>& pointsTarget,
+                      const std::vector<glm::vec3>& normalsTarget,
+                      const KDTree& tree) {
+    constexpr size_t maxNeighbors = 20;
+    constexpr int projectionIterations = 5;
+    const size_t neighborCount = std::min(maxNeighbors, pointsTarget.size());
+    glm::vec3 currentPoint = inputPoint;
+
+    for (int iteration = 0; iteration < projectionIterations; ++iteration) {
+        std::array<size_t, maxNeighbors> indices{};
+        std::array<float, maxNeighbors> squaredDistances{};
+        nanoflann::KNNResultSet<float> resultSet(neighborCount);
+        resultSet.init(indices.data(), squaredDistances.data());
+        tree.findNeighbors(resultSet, &currentPoint[0], nanoflann::SearchParameters());
+        if (resultSet.size() != neighborCount) {
+            throw std::runtime_error("HPSS neighbor search returned too few points");
+        }
+
+        const float radius = std::max(1e-6f, 1.5f * std::sqrt(squaredDistances[neighborCount - 1]));
+        glm::vec3 weightedProjection(0.0f);
+        float totalWeight = 0.0f;
+        for (size_t i = 0; i < neighborCount; ++i) {
+            const glm::vec3& normal = normalsTarget[indices[i]];
+            const float normalSquaredLength = glm::dot(normal, normal);
+            if (normalSquaredLength <= 1e-12f) {
+                continue;
+            }
+
+            const float t = std::sqrt(squaredDistances[i]) / radius;
+            const float oneMinusT = std::max(0.0f, 1.0f - t);
+            const float weight = oneMinusT * oneMinusT * oneMinusT * oneMinusT * (1.0f + 4.0f * t);
+            const glm::vec3 planeProjection = currentPoint
+                - glm::dot(currentPoint - pointsTarget[indices[i]], normal) / normalSquaredLength * normal;
+            weightedProjection += weight * planeProjection;
+            totalWeight += weight;
+        }
+        if (totalWeight <= 1e-8f) {
+            break;
+        }
+        currentPoint = weightedProjection / totalWeight;
+    }
+    return currentPoint;
+}
+
+void icpRecalage(const std::vector<glm::vec3> &pointsCandidate, const std::vector<glm::vec3> &pointsTarget, const std::vector<glm::vec3> &normalsTarget, glm::mat3 &rotation, glm::vec3 &translation) {
+
     if (pointsCandidate.empty() || pointsTarget.empty()) {
         throw std::invalid_argument("Point sets cant not be empty");
     }
-
+    if (pointsTarget.size() != normalsTarget.size()) {
+        throw std::invalid_argument("Target points and normals must have the same size");
+    }
 
     glm::mat3 totalR(1.0f);
     glm::vec3 totalT = glm::vec3(0.0f);
 
-    acpRecalage(pointsCandidate, pointsTarget,totalR, totalT);
-
     // apply ACP recalage to the working copy.
+    acpRecalage(pointsCandidate, pointsTarget,totalR, totalT);
     std::vector<glm::vec3> pointsSource = pointsCandidate;
     for (auto& point : pointsSource) {
         point = totalR * point + totalT;
@@ -275,32 +370,20 @@ void icpRecalage(const std::vector<glm::vec3> &pointsCandidate, const std::vecto
 
     double lastRSMD = 0.0;
 
-    // ierations
+    // iterations
     for (std::size_t round = 0; round < 100; ++round) {
 
-        // build correspondence relation
-        std::vector<Correspondence> correspondences;
-        correspondences.reserve(pointsSource.size());
-
-        for (std::size_t i = 0; i < pointsSource.size(); ++i) {
-            glm::vec3 &queryPoint = pointsSource[i];
-            size_t nearestIndex{};
-            float squaredDistance{};
-            nanoflann::KNNResultSet<float> resultSet(1);
-            resultSet.init(&nearestIndex, &squaredDistance);
-            tree.findNeighbors(resultSet, &queryPoint[0], nanoflann::SearchParameters());
-            if (resultSet.size() != 1) {
-                throw std::runtime_error("Nearest-neighbor search returned no point");
-            }
-            correspondences.push_back({i, nearestIndex, squaredDistance});
-        }
-
-        // compute RSMD for this iteration
+        // project each source point onto the HPSS surface of the target cloud.
+        std::vector<glm::vec3> projectedTargets;
+        projectedTargets.reserve(pointsSource.size());
         double RSMD = 0.0;
-        for (auto& c : correspondences) {
-            RSMD += c.squaredDistance;
+        for (const auto& point : pointsSource) {
+            const glm::vec3 projected = projectHPSS(point, pointsTarget, normalsTarget, tree);
+            projectedTargets.push_back(projected);
+            const glm::vec3 difference = point - projected;
+            RSMD += glm::dot(difference, difference);
         }
-        RSMD = std::sqrt(RSMD / correspondences.size());
+        RSMD = std::sqrt(RSMD / pointsSource.size());
         std::cout << "Round: " << round << ", RSMD: " << RSMD << std::endl;
 
         if (std::abs(RSMD - lastRSMD) < 1e-5) {
@@ -308,23 +391,11 @@ void icpRecalage(const std::vector<glm::vec3> &pointsCandidate, const std::vecto
             break;
         }
 
-        // create point set for svd recalage
-        std::vector<glm::vec3> pSource;
-        std::vector<glm::vec3> pTarget;
-        pSource.reserve(correspondences.size());
-        pTarget.reserve(correspondences.size());
-        for (std::size_t i = 0; i < correspondences.size(); ++i) {
-            size_t indexSource = correspondences[i].sourceIndex;
-            size_t indexTarget = correspondences[i].targetIndex;
-            pSource.push_back(pointsSource[indexSource]);
-            pTarget.push_back(pointsTarget[indexTarget]);
-        }
-
         glm::mat3 deltaR(1.0f);
         glm::vec3 deltaT(0.0f);
 
         // svd recalage
-        svdRecalage(pSource, pTarget, deltaR, deltaT);
+        svdRecalage(pointsSource, projectedTargets, deltaR, deltaT);
 
         totalT = deltaR * totalT + deltaT;
         totalR = deltaR * totalR;
@@ -343,10 +414,26 @@ void icpRecalage(const std::vector<glm::vec3> &pointsCandidate, const std::vecto
     translation = totalT;
 }
 
-void callback(std::vector<glm::vec3> & points1, std::vector<glm::vec3> points2, polyscope::PointCloud* ps1, polyscope::PointCloud* ps2) {
+void callback(std::vector<glm::vec3> & points1, std::vector<glm::vec3>& points2,
+              std::vector<glm::vec3>& normals2,
+              polyscope::PointCloud* ps1, polyscope::PointCloud* ps2) {
 
     ImGui::PushItemWidth(100);
     ImGuiIO &io = ImGui::GetIO();
+
+    if (ImGui::Button("Random transform target")) {
+        const RigidTransform transform = applyRandomRigidTransform(points2, &normals2);
+        ps2->updatePointPositions(points2);
+        ps2->addVectorQuantity("normals2", normals2);
+        std::cout << "Random rotation:" << std::endl;
+        for (int row = 0; row < 3; ++row) {
+            std::cout << transform.rotation[0][row] << " "
+                      << transform.rotation[1][row] << " "
+                      << transform.rotation[2][row] << std::endl;
+        }
+        std::cout << "Random translation: " << transform.translation.x << ", "
+                  << transform.translation.y << ", " << transform.translation.z << std::endl;
+    }
 
     if (ImGui::Button("ACP")) {
         Eigen::Vector3d centroid1, centroid2;
@@ -423,7 +510,7 @@ void callback(std::vector<glm::vec3> & points1, std::vector<glm::vec3> points2, 
         glm::mat3 rotation(1.0f);
         glm::vec3 translation(0.0f);
 
-        icpRecalage(points1, points2, rotation, translation);
+        icpRecalage(points1, points2, normals2, rotation, translation);
 
         for (auto &p : points1) {
             p = rotation * p + translation;
@@ -456,6 +543,9 @@ int main(int argc, char **argv) {
 
     // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino.pn", points, normals);
     readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino_subsampled_extreme.pn", points, normals);
+    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/african_statue2_subsampled_extreme.pn", points, normals);
+    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/african_statue2.pn", points, normals);
+    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/african_statue_partial_1.pn", points, normals);
 
     auto ps = polyscope::registerPointCloud("input ps",points);
     ps->addVectorQuantity("normals", normals);
@@ -467,6 +557,9 @@ int main(int argc, char **argv) {
 
     // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino2.pn", points2, normals2);
     readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/dino2_subsampled_extreme.pn", points2, normals2);
+    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/african_statue2_subsampled_extreme.pn", points2, normals2);
+    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/african_statue_partial_1.pn", points2, normals2);
+    // readPNFile(std::string(TP3_Recalage_SOURCE_DIR) + "/data/pointsets/african_statue.pn", points2, normals2);
 
     auto ps2 = polyscope::registerPointCloud("input ps2",points2);
     ps2->addVectorQuantity("normals2", normals2);
@@ -475,8 +568,8 @@ int main(int argc, char **argv) {
 
 
     // Add the callback
-    polyscope::state::userCallback = [&points, &points2, &ps, &ps2]() {
-        callback(points, points2, ps, ps2);
+    polyscope::state::userCallback = [&points, &points2, &normals2, &ps, &ps2]() {
+        callback(points, points2, normals2, ps, ps2);
     };
 
     // Show the gui
